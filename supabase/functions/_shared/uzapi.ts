@@ -1,6 +1,5 @@
-// Cliente da UZAPI Business. A API segue o formato da WhatsApp Cloud API (Meta):
-// POST https://api.uzapi.com.br/{username}/v1/{phone_number_id}/messages
-// Authorization: Bearer {token}
+// Cliente da uazapi (docs.uazapi.com).
+// POST {UAZAPI_URL}/send/text  com header "token: {UZAPI_TOKEN}"  body {number, text}
 
 export class ErroEnvio extends Error {
   constructor(msg: string, public status?: number, public temporario = true) {
@@ -8,35 +7,31 @@ export class ErroEnvio extends Error {
   }
 }
 
+const URL_PADRAO = "https://automate-takeat.uazapi.com";
+
 function env(nome: string): string {
   const v = Deno.env.get(nome);
   if (!v) throw new ErroEnvio(`Secret ${nome} não configurado`, undefined, false);
   return v.trim();
 }
 
-export function phoneNumberId(): string {
-  return env("UZAPI_PHONE_NUMBER_ID");
+export function urlBase(): string {
+  return (Deno.env.get("UAZAPI_URL") ?? URL_PADRAO).trim().replace(/\/+$/, "");
+}
+
+export function tokenInstancia(): string {
+  return env("UZAPI_TOKEN");
 }
 
 /** Envia texto e devolve o ID da mensagem no WhatsApp. */
 export async function enviarTexto(para: string, texto: string): Promise<string | null> {
-  const url = `https://api.uzapi.com.br/${env("UZAPI_USERNAME")}/v1/${phoneNumberId()}/messages`;
   let resp: Response;
   try {
-    resp = await fetch(url, {
+    resp = await fetch(`${urlBase()}/send/text`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${env("UZAPI_TOKEN")}`,
-      },
-      body: JSON.stringify({
-        messaging_product: "whatsapp",
-        recipient_type: "individual",
-        to: para,
-        type: "text",
-        text: { body: texto },
-      }),
-      signal: AbortSignal.timeout(15_000),
+      headers: { "Content-Type": "application/json", token: tokenInstancia() },
+      body: JSON.stringify({ number: para, text: texto, linkPreview: false }),
+      signal: AbortSignal.timeout(20_000),
     });
   } catch (e) {
     throw new ErroEnvio(`Falha de rede ao enviar: ${(e as Error).message}`);
@@ -46,11 +41,12 @@ export async function enviarTexto(para: string, texto: string): Promise<string |
   if (!resp.ok) {
     // 4xx (exceto 429) = problema no pedido: não adianta tentar de novo igual
     const temporario = resp.status === 429 || resp.status >= 500;
-    throw new ErroEnvio(`UZAPI ${resp.status}: ${corpo.slice(0, 300)}`, resp.status, temporario);
+    throw new ErroEnvio(`uazapi ${resp.status}: ${corpo.slice(0, 300)}`, resp.status, temporario);
   }
   try {
     const json = JSON.parse(corpo);
-    return json?.messages?.[0]?.id ?? json?.id ?? json?.messageId ?? null;
+    // messageid = ID do WhatsApp (é o que volta nos eventos de status e de mensagem)
+    return json?.messageid ?? json?.message?.messageid ?? json?.id ?? null;
   } catch {
     return null;
   }
