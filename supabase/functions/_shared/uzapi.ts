@@ -24,13 +24,14 @@ export function tokenInstancia(): string {
 }
 
 /** Envia texto e devolve o ID da mensagem no WhatsApp. */
-export async function enviarTexto(para: string, texto: string): Promise<string | null> {
+export async function enviarTexto(para: string, texto: string, citar: string | null = null): Promise<string | null> {
   let resp: Response;
   try {
     resp = await fetch(`${urlBase()}/send/text`, {
       method: "POST",
       headers: { "Content-Type": "application/json", token: tokenInstancia() },
-      body: JSON.stringify({ number: para, text: texto, linkPreview: false }),
+      // number: telefone (só dígitos) ou ID de grupo (...@g.us); replyid: cita a mensagem
+      body: JSON.stringify({ number: para, text: texto, linkPreview: false, ...(citar ? { replyid: citar } : {}) }),
       signal: AbortSignal.timeout(20_000),
     });
   } catch (e) {

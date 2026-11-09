@@ -118,18 +118,7 @@ function telefoneDe(...candidatos: unknown[]): string {
   return "";
 }
 
-async function tratarMensagem(m: Qualquer, payload: Qualquer): Promise<string | null> {
-  const chatid = String(m?.chatid ?? payload?.chat?.wa_chatid ?? "");
-  if (m?.isGroup === true || chatid.endsWith("@g.us") || chatid.endsWith("@newsletter")) return null;
-  if (m?.wasSentByApi === true) return null; // enviada pelo próprio robô
-
-  const msgId = String(m?.messageid ?? m?.id ?? "");
-  const telefone = telefoneDe(chatid, m?.sender_pn, payload?.chat?.phone, m?.sender);
-  if (!msgId || !telefone) {
-    await log("aviso", "webhook", "mensagem_sem_id_ou_telefone", { temId: !!msgId, chatid: chatid.split("@")[1] ?? "" });
-    return null;
-  }
-
+function dadosDaMensagem(m: Qualquer) {
   const conteudo: string | null =
     (typeof m?.text === "string" && m.text) ||
     m?.content?.text ||
@@ -141,18 +130,78 @@ async function tratarMensagem(m: Qualquer, payload: Qualquer): Promise<string | 
   let ts = Number(m?.messageTimestamp ?? 0);
   if (ts && ts < 1e12) ts *= 1000; // veio em segundos
   const criadaEm = ts ? new Date(ts).toISOString() : undefined;
+  return { conteudo, tipo, criadaEm };
+}
 
+async function tratarMensagem(m: Qualquer, payload: Qualquer): Promise<string | null> {
+  const chatid = String(m?.chatid ?? payload?.chat?.wa_chatid ?? "");
+  if (chatid.endsWith("@newsletter") || chatid === "status@broadcast") return null;
+  if (m?.wasSentByApi === true) return null; // enviada pelo próprio robô
+
+  const msgId = String(m?.messageid ?? m?.id ?? "");
+  const ehGrupo = m?.isGroup === true || chatid.endsWith("@g.us");
+
+  if (ehGrupo) {
+    const permitidos = (await config())["grupos_permitidos"];
+    if (!Array.isArray(permitidos) || !permitidos.includes(chatid)) return null; // grupo não autorizado
+    if (!msgId) return null;
+    return await tratarMensagemDeGrupo(m, payload, chatid, msgId);
+  }
+
+  const telefone = telefoneDe(chatid, m?.sender_pn, payload?.chat?.phone, m?.sender);
+  if (!msgId || !telefone) {
+    await log("aviso", "webhook", "mensagem_sem_id_ou_telefone", { temId: !!msgId, chatid: chatid.split("@")[1] ?? "" });
+    return null;
+  }
+
+  const { conteudo, tipo, criadaEm } = dadosDaMensagem(m);
   const fromMe = m?.fromMe === true;
   const nome = fromMe ? null : (m?.senderName ?? payload?.chat?.name ?? null);
-  const { contatoId, conversaId } = await obterConversa(telefone, nome);
+  const contatoId = await obterContato(telefone, nome, "pessoa");
+  const conversaId = await obterConversa(contatoId);
 
   if (fromMe) {
     // Mensagem enviada pelo número da Takeat, mas não pelo robô:
     // alguém respondeu pelo WhatsApp Web. O robô pausa nessa conversa.
-    await registrarRespostaHumana(contatoId, conversaId, msgId, tipo, conteudo, criadaEm, telefone);
+    const nova = await registrarRespostaHumana(contatoId, conversaId, msgId, tipo, conteudo, criadaEm);
+    if (nova) await pausarConversa(conversaId, telefone);
     return null;
   }
 
+  return await registrarEntrada(conversaId, contatoId, msgId, tipo, conteudo, criadaEm, telefone);
+}
+
+/** Grupo autorizado: a conversa é do grupo; cada mensagem guarda quem escreveu. */
+async function tratarMensagemDeGrupo(m: Qualquer, payload: Qualquer, grupoId: string, msgId: string) {
+  const { conteudo, tipo, criadaEm } = dadosDaMensagem(m);
+  const grupoContatoId = await obterContato(grupoId, payload?.chat?.name ?? null, "grupo");
+  const conversaId = await obterConversa(grupoContatoId);
+
+  if (m?.fromMe === true) {
+    // Alguém respondeu no grupo pelo número da Takeat. Registra, mas não pausa o grupo inteiro.
+    await registrarRespostaHumana(grupoContatoId, conversaId, msgId, tipo, conteudo, criadaEm);
+    return null;
+  }
+
+  const sender = typeof m?.sender === "string" ? m.sender : "";
+  const telefone = telefoneDe(m?.sender_pn, sender) || sender; // sem número: usa o ID @lid
+  if (!telefone) {
+    await log("aviso", "webhook", "grupo_sem_remetente", {});
+    return null;
+  }
+  const pessoaId = await obterContato(telefone, m?.senderName ?? null, "pessoa");
+  return await registrarEntrada(conversaId, pessoaId, msgId, tipo, conteudo, criadaEm, telefone);
+}
+
+async function registrarEntrada(
+  conversaId: string,
+  contatoId: string,
+  msgId: string,
+  tipo: string,
+  conteudo: string | null,
+  criadaEm: string | undefined,
+  telefone: string,
+): Promise<string | null> {
   const { error } = await db().from("mensagens").insert({
     conversa_id: conversaId,
     contato_id: contatoId,
@@ -175,23 +224,27 @@ async function tratarMensagem(m: Qualquer, payload: Qualquer): Promise<string | 
   return conversaId;
 }
 
-async function obterConversa(telefone: string, nome: string | null) {
-  const { data: contato, error: e1 } = await db().from("contatos")
+async function obterContato(telefone: string, nome: string | null, tipo: "pessoa" | "grupo"): Promise<string> {
+  const { data, error } = await db().from("contatos")
     .upsert(
-      { telefone, ...(nome ? { nome } : {}), ultimo_contato_em: new Date().toISOString() },
+      { telefone, tipo, ...(nome ? { nome } : {}), ultimo_contato_em: new Date().toISOString() },
       { onConflict: "telefone" },
     )
     .select("id").single();
-  if (e1) throw new Error(`contato: ${e1.message}`);
-
-  await db().from("conversas")
-    .upsert({ contato_id: contato.id }, { onConflict: "contato_id", ignoreDuplicates: true });
-  const { data: conversa, error: e2 } = await db().from("conversas")
-    .select("id").eq("contato_id", contato.id).single();
-  if (e2) throw new Error(`conversa: ${e2.message}`);
-  return { contatoId: contato.id as string, conversaId: conversa.id as string };
+  if (error) throw new Error(`contato: ${error.message}`);
+  return data.id as string;
 }
 
+async function obterConversa(contatoId: string): Promise<string> {
+  await db().from("conversas")
+    .upsert({ contato_id: contatoId }, { onConflict: "contato_id", ignoreDuplicates: true });
+  const { data, error } = await db().from("conversas")
+    .select("id").eq("contato_id", contatoId).single();
+  if (error) throw new Error(`conversa: ${error.message}`);
+  return data.id as string;
+}
+
+/** Grava mensagem enviada por um humano pelo número da Takeat. Devolve true se é nova. */
 async function registrarRespostaHumana(
   contatoId: string,
   conversaId: string,
@@ -199,14 +252,13 @@ async function registrarRespostaHumana(
   tipo: string,
   conteudo: string | null,
   criadaEm: string | undefined,
-  telefone: string,
-) {
+): Promise<boolean> {
   // Proteção extra: se for o eco de uma resposta recente do robô, ignora
   if (conteudo) {
     const { data: eco } = await db().from("mensagens").select("id")
       .eq("conversa_id", conversaId).eq("autor", "bot").eq("conteudo", conteudo)
       .gte("criada_em", new Date(Date.now() - 5 * 60_000).toISOString()).limit(1);
-    if (eco?.length) return;
+    if (eco?.length) return false;
   }
 
   const { error } = await db().from("mensagens").insert({
@@ -220,9 +272,12 @@ async function registrarRespostaHumana(
     status: "enviada",
     criada_em: criadaEm,
   });
-  if (error?.code === "23505") return; // já registrada (ou é a própria resposta do robô)
+  if (error?.code === "23505") return false; // já registrada (ou é a própria resposta do robô)
   if (error) throw new Error(`mensagem humana: ${error.message}`);
+  return true;
+}
 
+async function pausarConversa(conversaId: string, telefone: string) {
   const horas = await configNumero("horas_modo_humano", 24);
   await db().from("conversas").update({
     modo: "humano",

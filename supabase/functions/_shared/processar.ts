@@ -10,6 +10,7 @@ type Mensagem = {
   contato_id: string;
   conteudo: string | null;
   tipo: string;
+  provedor_msg_id: string | null;
   tentativas: number;
   criada_em: string;
 };
@@ -55,12 +56,12 @@ export async function processarConversa(conversaId: string): Promise<void> {
   try {
     const { data: conversa, error: e1 } = await db()
       .from("conversas")
-      .select("id, modo, modo_humano_ate, contatos(telefone, bloqueado)")
+      .select("id, modo, modo_humano_ate, contatos(telefone, bloqueado, tipo)")
       .eq("id", conversaId)
       .single();
     if (e1 || !conversa) throw new Error(`conversa não encontrada: ${e1?.message}`);
     // deno-lint-ignore no-explicit-any
-    const contato = (conversa as any).contatos as { telefone: string; bloqueado: boolean };
+    const contato = (conversa as any).contatos as { telefone: string; bloqueado: boolean; tipo: string };
 
     // Bot pausado (humano atendendo) ou contato bloqueado: registra e não responde
     const humanoAtivo = conversa.modo === "humano" &&
@@ -73,7 +74,9 @@ export async function processarConversa(conversaId: string): Promise<void> {
     }
 
     const resposta = await gerarResposta(msgs);
-    await responder(conversaId, msgs, contato.telefone, resposta, Date.now() - inicio);
+    // Em grupo, responde em cima da mensagem de quem perguntou
+    const citar = contato.tipo === "grupo" ? msgs[msgs.length - 1].provedor_msg_id : null;
+    await responder(conversaId, msgs, contato.telefone, resposta, Date.now() - inicio, citar);
   } catch (e) {
     await marcarErro(msgs, e as Error);
   }
@@ -85,6 +88,7 @@ async function responder(
   telefone: string,
   r: Resposta,
   latenciaGeracao: number,
+  citar: string | null = null,
 ) {
   const ultima = entradas[entradas.length - 1];
   const { data: saida, error } = await db().from("mensagens").insert({
@@ -108,7 +112,7 @@ async function responder(
   if (error) throw new Error(`gravar saída: ${error.message}`);
 
   try {
-    const msgId = await enviarTexto(telefone, r.texto);
+    const msgId = await enviarTexto(telefone, r.texto, citar);
     const agora = new Date().toISOString();
     await db().from("mensagens")
       .update({ status: "enviada", provedor_msg_id: msgId, processada_em: agora })
